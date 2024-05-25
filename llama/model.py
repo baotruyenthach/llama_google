@@ -3,7 +3,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -14,6 +14,7 @@ from fairscale.nn.model_parallel.layers import (
     RowParallelLinear,
 )
 from torch import nn
+import torch.distributed as dist
 
 
 @dataclass
@@ -29,6 +30,8 @@ class ModelArgs:
 
     max_batch_size: int = 32
     max_seq_len: int = 2048
+    seq_total_len: Optional[int] = None
+    output_attentions: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -203,6 +206,7 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
+        self.output_attentions = args.output_attentions
 
         self.wq = ColumnParallelLinear(
             args.dim,
@@ -250,6 +254,10 @@ class Attention(nn.Module):
             )
         ).cuda()
 
+        # Attributes for attention caching
+        self.attention_scores = None
+        self.args = args
+
     def forward(
         self,
         x: torch.Tensor,
@@ -288,6 +296,7 @@ class Attention(nn.Module):
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
+        
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
         values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
@@ -296,9 +305,15 @@ class Attention(nn.Module):
         keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
         values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+   
+        
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+
+        if self.args.output_attentions:
+            self.attention_scores = scores.detach()#.cpu()
+        
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
@@ -453,6 +468,11 @@ class Transformer(nn.Module):
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
 
+        # Attributes for attention caching
+        model_parallel_size = fs_init.get_model_parallel_world_size()
+        self.n_local_heads = params.n_heads // model_parallel_size
+        self.attentions = []
+
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         """
@@ -488,8 +508,60 @@ class Transformer(nn.Module):
                 mask
             ]).type_as(h)
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             h = layer(h, start_pos, freqs_cis, mask)
+
+            # Cache attention scores for each layer
+            if self.params.output_attentions:
+                if layer_idx >= len(self.attentions):
+                    attention = torch.zeros((_bsz, self.n_local_heads, 
+                                            self.params.seq_total_len, self.params.seq_total_len)).to(device=layer.attention.attention_scores.device)
+                    self.attentions.append(attention)            
+
+                self.attentions[layer_idx][:,:, start_pos:start_pos+layer.attention.attention_scores.shape[-2], :layer.attention.attention_scores.shape[-1]] = \
+                        layer.attention.attention_scores
+                del layer.attention.attention_scores
+
         h = self.norm(h)
         output = self.output(h).float()
-        return output
+        return output 
+       
+    def get_attention_matrices(self) -> List:
+        """
+        Return gathered_attentions (List): a list of attention matrices for each layer.
+
+        len(gathered_attentions) = n_layers
+        gathered_attentions[i].shape = (bs, n_heads, seq_total_len, seq_total_len)
+        seq_total_len: the total length of both the prompt and the generated sequence.
+        """
+        
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        gathered_attentions = []
+
+        # Gather attentions for each layer across all GPUs
+        for layer_attention in self.attentions:  # iterate over each layer
+            if rank == 0:
+                # Create a list of tensors to gather into only on the root process
+                gathered_layer_attention = [torch.zeros_like(layer_attention) for _ in range(world_size)]
+            else:
+                gathered_layer_attention = None
+            
+            # Gather attentions from all GPUs to the root process
+            dist.gather(layer_attention, gathered_layer_attention, dst=0)
+            
+            if rank == 0:
+                # Concatenate attentions over the batch dimension
+                gathered_attentions.append(torch.cat(gathered_layer_attention, dim=1).cpu())
+                del gathered_layer_attention
+
+        if rank == 0:
+            return gathered_attentions
+        else:
+            return None  # Other ranks return None
+
+
+
+
+
+

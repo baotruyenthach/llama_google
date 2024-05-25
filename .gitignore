@@ -1,3 +1,10 @@
+# Personal test files, downloaded checkpoints, generated figures
+/test_*
+checkpoints/
+*.png
+/reshard.py
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

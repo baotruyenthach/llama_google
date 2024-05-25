@@ -120,11 +120,13 @@ class Llama:
         model.load_state_dict(checkpoint, strict=False)
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
+        
         return Llama(model, tokenizer)
 
     def __init__(self, model: Transformer, tokenizer: Tokenizer):
         self.model = model
         self.tokenizer = tokenizer
+        self.attentions = None
 
     @torch.inference_mode()
     def generate(
@@ -135,6 +137,7 @@ class Llama:
         top_p: float = 0.9,
         logprobs: bool = False,
         echo: bool = False,
+        output_attentions: bool = False,
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
         """
         Generate text sequences based on provided prompts using the language generation model.
@@ -155,14 +158,20 @@ class Llama:
             If logprobs is True, token log probabilities are computed for each generated token.
 
         """
+        self.model.params.output_attentions = output_attentions
+
         params = self.model.params
         bsz = len(prompt_tokens)
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
         min_prompt_len = min(len(t) for t in prompt_tokens)
-        max_prompt_len = max(len(t) for t in prompt_tokens)
+        max_prompt_len = max(len(t) for t in prompt_tokens)        
+
+        print("***Current prompt len:", max_prompt_len)
         assert max_prompt_len <= params.max_seq_len
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
+
+        self.model.params.seq_total_len = total_len
 
         pad_id = self.tokenizer.pad_id
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
@@ -174,7 +183,7 @@ class Llama:
         prev_pos = 0
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != pad_id
-        if min_prompt_len == total_len:
+        if min_prompt_len == total_len:            
             logits = self.model.forward(tokens, prev_pos)
             token_logprobs = -F.cross_entropy(
                 input=logits.transpose(1, 2),
@@ -221,7 +230,8 @@ class Llama:
             probs = None
             if logprobs:
                 probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
-            # cut to eos tok if any
+            
+            # cut to eos tok if any           
             if self.tokenizer.eos_id in toks:
                 eos_idx = toks.index(self.tokenizer.eos_id)
                 toks = toks[:eos_idx]
@@ -238,6 +248,7 @@ class Llama:
         max_gen_len: Optional[int] = None,
         logprobs: bool = False,
         echo: bool = False,
+        output_attentions: bool = False,
     ) -> List[CompletionPrediction]:
         """
         Perform text completion for a list of prompts using the language generation model.
@@ -269,7 +280,9 @@ class Llama:
             top_p=top_p,
             logprobs=logprobs,
             echo=echo,
+            output_attentions=output_attentions,
         )
+        
         if logprobs:
             return [
                 {
@@ -288,6 +301,7 @@ class Llama:
         top_p: float = 0.9,
         max_gen_len: Optional[int] = None,
         logprobs: bool = False,
+        output_attentions: bool = False,
     ) -> List[ChatPrediction]:
         """
         Generate assistant responses for a list of conversational dialogs using the language generation model.
@@ -367,6 +381,7 @@ class Llama:
             temperature=temperature,
             top_p=top_p,
             logprobs=logprobs,
+            output_attentions=output_attentions,
         )
         if logprobs:
             return [
